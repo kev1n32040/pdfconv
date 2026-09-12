@@ -308,6 +308,44 @@ async def cancel_merge(m: Message, state: FSMContext):
     await m.answer("Отменил. Выбери действие 👇", reply_markup=main_kb())
 
 
+@router.callback_query(F.data == "mode_note")
+async def cb_note(cb):
+    await cb.message.answer(
+        "Пришли видео (как файл или обычным видео) — верну кружочком. "
+        "Обрежу до 60 секунд, если длиннее."
+    )
+    await cb.answer()
+
+
+@router.message(F.video | (F.document & F.document.mime_type.startswith("video/")))
+async def do_video_note(m: Message, bot: Bot):
+    """Видео → кружочек."""
+    media = m.video or m.document
+    if media.file_size and media.file_size > MAX_FILE_SIZE:
+        await m.answer("Файл больше 20 МБ — такие Bot API скачать не даёт 😔")
+        return
+    if not await db.consume_quota(m.from_user.id):
+        await m.answer(limit_text(), reply_markup=main_kb())
+        return
+
+    Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
+    src_path = Path(DOWNLOAD_DIR) / f"{m.from_user.id}_{media.file_unique_id}.mp4"
+    dst = src_path.with_name(src_path.stem + "_note.mp4")
+    wait = await m.answer("Конвертирую в кружочек… ⏳")
+    try:
+        await bot.download(media, destination=src_path)
+        await video_to_note(src_path, dst)
+        await m.answer_video_note(
+            BufferedInputFile(dst.read_bytes(), filename="note.mp4")
+        )
+    except RuntimeError as e:
+        await m.answer(f"Не получилось обработать видео: {e}")
+    finally:
+        await wait.delete()
+        src_path.unlink(missing_ok=True)
+        dst.unlink(missing_ok=True)
+
+
 @router.message(F.document)
 async def do_compress(m: Message, bot: Bot, state: FSMContext):
     """Любой документ вне режима склейки — сжимаем (с выбором качества)."""
