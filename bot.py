@@ -20,14 +20,7 @@ from aiogram.types import (
 )
 
 import db
-from config import (
-    BOT_TOKEN,
-    CRYPTOCLOUD_SHOP_ID,
-    CRYPTOCLOUD_TOKEN,
-    DOWNLOAD_DIR,
-    FREE_DAILY_LIMIT,
-    MAX_FILE_SIZE,
-)
+from config import BOT_TOKEN, DOWNLOAD_DIR, FREE_DAILY_LIMIT, MAX_FILE_SIZE
 from pdf_tools import compress_pdf, human_size, merge_pdfs
 from video_tools import video_to_note
 
@@ -172,9 +165,15 @@ async def cb_pay_stars(cb):
 
 @router.callback_query(F.data == "pay_crypto")
 async def cb_pay_crypto(cb):
-    from cryptocloud import CryptoError, create_invoice
-    if not CRYPTOCLOUD_TOKEN or not CRYPTOCLOUD_SHOP_ID:
-        await cb.message.answer("Крипто-оплата временно недоступна. Попробуй Stars ⭐")
+    from cryptocloud import CryptoError, create_invoice, missing_creds
+    miss = missing_creds()
+    if miss:
+        logging.error("crypto disabled, missing: %s", miss)
+        await cb.message.answer(
+            "Крипто-оплата не настроена на сервере (не заданы: "
+            + ", ".join(miss)
+            + "). Попробуй Stars ⭐"
+        )
         await cb.answer()
         return
     try:

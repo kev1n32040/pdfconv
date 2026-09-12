@@ -1,12 +1,13 @@
 """Крипто-платежи через Trybit (бывший CryptoCloud) — https://trybit.com.
 
 Ключи: кабинет → «Мои проекты» → настройки проекта → API KEY и SHOP ID.
-Новые проекты стартуют в тест-режиме: счёт можно подтвердить из кабинета
-кнопкой «Confirm invoice without payment» — удобно для проверки без денег.
+Ключи ищутся в config.py (CRYPTOCLOUD_TOKEN / CRYPTOCLOUD_SHOP_ID),
+а если их там нет — в переменных окружения. Код не падает,
+если config.py старой версии.
 """
-import aiohttp
+import os
 
-from config import CRYPTOCLOUD_SHOP_ID, CRYPTOCLOUD_TOKEN
+import aiohttp
 
 BASE = "https://api.trybit.com/v2"
 
@@ -18,21 +19,44 @@ class CryptoError(RuntimeError):
     pass
 
 
+def creds() -> tuple[str, str]:
+    """(token, shop_id) из config.py или env. Пустые строки, если не заданы."""
+    try:
+        import config
+    except Exception:
+        config = None
+    token = (getattr(config, "CRYPTOCLOUD_TOKEN", "") if config else "") \
+        or os.getenv("CRYPTOCLOUD_TOKEN", "")
+    shop = (getattr(config, "CRYPTOCLOUD_SHOP_ID", "") if config else "") \
+        or os.getenv("CRYPTOCLOUD_SHOP_ID", "")
+    return token.strip(), shop.strip()
+
+
+def missing_creds() -> list[str]:
+    token, shop = creds()
+    miss = []
+    if not token:
+        miss.append("CRYPTOCLOUD_TOKEN")
+    if not shop:
+        miss.append("CRYPTOCLOUD_SHOP_ID")
+    return miss
+
+
 def _headers() -> dict:
+    token, _ = creds()
     return {
-        "Authorization": f"Token {CRYPTOCLOUD_TOKEN}",
+        "Authorization": f"Token {token}",
         "Content-Type": "application/json",
     }
 
 
 async def create_invoice(user_id: int, amount_usd: float, minutes: int = 15) -> dict:
     """Создаёт счёт. Возвращает {'invoice_id': 'INV-...', 'pay_url': 'https://...'}."""
-    if not CRYPTOCLOUD_TOKEN or not CRYPTOCLOUD_SHOP_ID:
-        raise CryptoError(
-            "не заполнены CRYPTOCLOUD_TOKEN / CRYPTOCLOUD_SHOP_ID в config.py"
-        )
+    token, shop = creds()
+    if not token or not shop:
+        raise CryptoError("не заданы ключи: " + ", ".join(missing_creds()))
     payload = {
-        "shop_id": CRYPTOCLOUD_SHOP_ID,
+        "shop_id": shop,
         "amount": amount_usd,
         "currency": "USD",
         "order_id": f"premium_{user_id}",  # привязка счёта к юзеру
