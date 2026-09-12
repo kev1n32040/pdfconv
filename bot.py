@@ -1,6 +1,7 @@
 """Файл-обработчик: MVP телеграм-бота (сжатие/склейка PDF, лимиты, оплата Stars)."""
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -26,8 +27,10 @@ from video_tools import video_to_note
 logging.basicConfig(level=logging.INFO)
 router = Router()
 
-ADMIN_IDS: set[int] = set()  # добавь свой user_id для /grant
-PREMIUM_PRICE_STARS = 100  # цена подписки на 30 дней в Telegram Stars
+ADMIN_IDS: set[int] = {8593355445}
+PREMIUM_PRICE_STARS = 100   # цена подписки на 30 дней в Telegram Stars
+PREMIUM_PRICE_USDT = 2      # ориентировочная цена в USDT для крипто-оплаты
+CRYPTOBOT_TOKEN = os.getenv("CRYPTOBOT_TOKEN", "")  # токен от @CryptoBot (@CryptoTestnetBot для тестов)
 
 
 class MergeState(StatesGroup):
@@ -137,6 +140,18 @@ async def cmd_grant(m: Message):
 
 @router.callback_query(F.data == "buy_premium")
 async def cb_buy(cb):
+    await cb.message.answer(
+        "Выбери способ оплаты Premium (30 дней безлимита):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⭐ Telegram Stars ({PREMIUM_PRICE_STARS}⭐)", callback_data="pay_stars")],
+            [InlineKeyboardButton(text=f"💎 Крипта (~{PREMIUM_PRICE_USDT} USDT / TON / BTC)", callback_data="pay_crypto")],
+        ]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "pay_stars")
+async def cb_pay_stars(cb):
     prices = [LabeledPrice(label="Premium на 30 дней", amount=PREMIUM_PRICE_STARS)]
     await cb.message.answer_invoice(
         title="Premium-подписка",
@@ -147,6 +162,52 @@ async def cb_buy(cb):
     )
     await cb.answer()
 
+
+@router.callback_query(F.data == "pay_crypto")
+async def cb_pay_crypto(cb):
+    if not CRYPTOBOT_TOKEN:
+        await cb.message.answer("Крипто-оплата временно недоступна. Попробуй Stars ⭐")
+        await cb.answer()
+        return
+    try:
+        from crypto import create_invoice
+        inv = await create_invoice(CRYPTOBOT_TOKEN, cb.from_user.id, PREMIUM_PRICE_USDT)
+    except Exception as e:
+        logging.exception("crypto invoice failed")
+        await cb.message.answer(f"Не удалось создать счёт: {e}")
+        await cb.answer()
+        return
+    await cb.message.answer(
+        f"💎 Счёт на {PREMIUM_PRICE_USDT} USDT (можно платить USDT, TON, BTC и др.):\n\n"
+        "1. Оплати по кнопке ниже\n"
+        "2. Вернись сюда и нажми «Проверить оплату»",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить", url=inv["pay_url"])],
+            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_crypto:{inv['invoice_id']}")],
+        ]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("check_crypto:"))
+async def cb_check_crypto(cb):
+    invoice_id = int(cb.data.split(":")[1])
+    try:
+        from crypto import check_invoice
+        paid = await check_invoice(CRYPTOBOT_TOKEN, invoice_id, cb.from_user.id)
+    except Exception as e:
+        logging.exception("crypto check failed")
+        await cb.message.answer(f"Ошибка проверки: {e}")
+        await cb.answer()
+        return
+    if paid:
+        await db.grant_premium(cb.from_user.id, days=30)
+        await db.log_payment(cb.from_user.id, 0)  # сумма в Stars = 0, т.к. крипта
+        await cb.message.answer("✅ Оплата получена! Premium активен на 30 дней. Спасибо!")
+    else:
+        await cb.answer("Оплата пока не найдена. Если только что платил — подожди минуту и проверь снова.", show_alert=True)
+        return
+    await cb.answer()
 
 @router.pre_checkout_query()
 async def pre_checkout(q: PreCheckoutQuery):
