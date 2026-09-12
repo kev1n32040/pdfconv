@@ -34,6 +34,10 @@ class MergeState(StatesGroup):
     collecting = State()
 
 
+class CompressState(StatesGroup):
+    waiting_quality = State()
+
+
 def main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗜 Сжать PDF", callback_data="mode_compress")],
@@ -233,84 +237,61 @@ async def cancel_merge(m: Message, state: FSMContext):
 
 
 @router.message(F.document)
-async def do_compress(m: Message, bot: Bot):
-    """Любой документ вне режима склейки — сжимаем."""
-    src = await download_doc(bot, m)
-    if not src:
+async def do_compress(m: Message, bot: Bot, state: FSMContext):
+    """Любой документ вне режима склейки — сжимаем (с выбором качества)."""
+    src_path = await download_doc(bot, m)
+    if not src_path:
         return
-    if not await db.consume_quota(m.from_user.id):
+    # сохраняем путь и оригинальное имя — file_unique_id может содержать "_"
+    await state.set_state(CompressState.waiting_quality)
+    await state.update_data(pdf_path=str(src_path), orig_name=m.document.file_name or "file.pdf")
+    await m.answer(
+        "Выбери качество сжатия:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Сильное (для экрана)", callback_data="q_low")],
+            [InlineKeyboardButton(text="⚖️ Среднее", callback_data="q_medium")],
+            [InlineKeyboardButton(text="🖨 Высокое (печать)", callback_data="q_high")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("q_"), CompressState.waiting_quality)
+async def cb_compress_quality(cb, bot: Bot, state: FSMContext):
+    preset = cb.data[2:]
+    data = await state.get_data()
+    await state.clear()
+    src = Path(data["pdf_path"])
+    orig_name = data.get("orig_name") or "file.pdf"
+
+    if not await db.consume_quota(cb.from_user.id):
         src.unlink(missing_ok=True)
-        await m.answer(limit_text(), reply_markup=main_kb())
+        await cb.message.answer(limit_text(), reply_markup=main_kb())
+        await cb.answer()
         return
-    wait = await m.answer("Сжимаю… ⏳")
+
+    wait = await cb.message.answer("Сжимаю… ⏳")
     dst = src.with_name(src.stem + "_min.pdf")
     try:
-        before, after = await asyncio.to_thread(compress_pdf, src, dst)
-        ratio = f" ({human_size(before)} → {human_size(after)})"
-        await m.answer_document(
-            BufferedInputFile(dst.read_bytes(), filename=f"compressed_{src.name.split('_', 1)[-1]}"),
-            caption=f"Готово!{ratio}",
-        )
-    finally:
-        await wait.delete()
-        src.unlink(missing_ok=True)
-        dst.unlink(missing_ok=True)
-
-
-
-@router.callback_query(F.data == "mode_note")
-async def cb_note(cb):
-    await cb.message.answer(
-        "Пришли видео (как файл или обычным видео) — верну кружочком. "
-        "Обрежу до 60 секунд, если длиннее."
-    )
-    await cb.answer()
-
-
-@router.message(F.video | (F.document & F.document.mime_type.startswith("video/")))
-async def do_video_note(m: Message, bot: Bot):
-    """Видео → кружочек."""
-    media = m.video or m.document
-    if media.file_size and media.file_size > MAX_FILE_SIZE:
-        await m.answer("Файл больше 20 МБ — такие Bot API скачать не даёт 😔")
-        return
-    if not await db.consume_quota(m.from_user.id):
-        await m.answer(limit_text(), reply_markup=main_kb())
-        return
-
-    Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
-    src = Path(DOWNLOAD_DIR) / f"{m.from_user.id}_{media.file_unique_id}.mp4"
-    dst = src.with_name(src.stem + "_note.mp4")
-    wait = await m.answer("Конвертирую в кружочек… ⏳")
-    try:
-        await bot.download(media, destination=src)
-        await video_to_note(src, dst)
-        await m.answer_video_note(
-            BufferedInputFile(dst.read_bytes(), filename="note.mp4")
+        before, after = await compress_pdf(src, dst, preset)
+        if after < before:
+            saved = 100 - round(after / before * 100)
+            caption = f"Готово! {human_size(before)} → {human_size(after)} (−{saved}%)"
+        else:
+            caption = (
+                "Сжать сильнее не получилось — файл уже оптимизирован "
+                f"({human_size(before)})."
+            )
+        await cb.message.answer_document(
+            BufferedInputFile(dst.read_bytes(), filename=f"compressed_{orig_name}"),
+            caption=caption,
         )
     except RuntimeError as e:
-        await m.answer(f"Не получилось обработать видео: {e}")
+        await cb.message.answer(f"Не получилось сжать файл: {e}")
     finally:
         await wait.delete()
         src.unlink(missing_ok=True)
         dst.unlink(missing_ok=True)
-
-
-
-@router.callback_query(F.data == "show_ref")
-async def cb_ref(cb, bot: Bot):
-    me = await bot.me()
-    count = await db.get_ref_count(cb.from_user.id)
-    bonus = await db.get_bonus(cb.from_user.id)
-    link = f"https://t.me/{me.username}?start=ref{cb.from_user.id}"
-    await cb.message.answer(
-        "🔗 Твоя реферальная ссылка:\n"
-        f"{link}\n\n"
-        f"За каждого нового пользователя — +{db.REF_BONUS} бонусные операции.\n"
-        f"👥 Приглашено: {count} | 🎁 Бонусов: {bonus}"
-    )
     await cb.answer()
-
 
 def limit_text() -> str:
     return (
