@@ -1,0 +1,331 @@
+"""Файл-обработчик: MVP телеграм-бота (сжатие/склейка PDF, лимиты, оплата Stars)."""
+import asyncio
+import logging
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BufferedInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+)
+
+import db
+from config import BOT_TOKEN, DOWNLOAD_DIR, FREE_DAILY_LIMIT, MAX_FILE_SIZE
+from pdf_tools import compress_pdf, human_size, merge_pdfs
+from video_tools import video_to_note
+
+logging.basicConfig(level=logging.INFO)
+router = Router()
+
+ADMIN_IDS: set[int] = set()  # добавь свой user_id для /grant
+PREMIUM_PRICE_STARS = 100  # цена подписки на 30 дней в Telegram Stars
+
+
+class MergeState(StatesGroup):
+    collecting = State()
+
+
+def main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗜 Сжать PDF", callback_data="mode_compress")],
+        [InlineKeyboardButton(text="📎 Склеить PDF", callback_data="mode_merge")],
+        [InlineKeyboardButton(text="⭕️ Видео в кружочек", callback_data="mode_note")],
+        [InlineKeyboardButton(text="⭐ Premium", callback_data="buy_premium")],
+        [InlineKeyboardButton(text="🔗 Пригласить друга (+бонусы)", callback_data="show_ref")],
+    ])
+
+
+@router.message(CommandStart())
+async def cmd_start(m: Message, command: CommandObject, bot: Bot):
+    # реферальный payload: /start ref123
+    referrer = None
+    if command.args and command.args.startswith("ref"):
+        try:
+            referrer = int(command.args[3:])
+        except ValueError:
+            pass
+
+    is_new = await db.register_user(m.from_user.id, m.from_user.username, referrer)
+
+    if is_new and referrer:
+        # сообщаем пригласившему о бонусе
+        try:
+            await bot.send_message(
+                referrer,
+                f"🎉 По твоей ссылке пришёл новый пользователь! "
+                f"+{db.REF_BONUS} бонусные операции на твой счёт.",
+            )
+        except Exception:
+            pass  # юзер мог заблокировать бота
+
+    bonus = await db.get_bonus(m.from_user.id)
+    bonus_line = f"\n🎁 Бонусных операций: {bonus}" if bonus else ""
+
+    await m.answer(
+        "Привет! Я обрабатываю файлы прямо в Telegram.\n\n"
+        "Что умею:\n"
+        "• 🗜 Сжимать PDF\n"
+        "• 📎 Склеивать несколько PDF в один\n"
+        "• ⭕️ Превращать видео в кружочки\n\n"
+        f"Бесплатно — {FREE_DAILY_LIMIT} операции в день. "
+        f"Premium — без лимитов.{bonus_line}\n\nВыбери действие 👇",
+        reply_markup=main_kb(),
+    )
+
+
+@router.message(Command("ref"))
+async def cmd_ref(m: Message, bot: Bot):
+    """Личная реферальная ссылка и счётчик приглашённых."""
+    me = await bot.me()
+    count = await db.get_ref_count(m.from_user.id)
+    bonus = await db.get_bonus(m.from_user.id)
+    link = f"https://t.me/{me.username}?start=ref{m.from_user.id}"
+    await m.answer(
+        "🔗 Твоя реферальная ссылка:\n"
+        f"{link}\n\n"
+        f"За каждого нового пользователя — +{db.REF_BONUS} бонусные операции "
+        "(тратятся, когда дневной лимит кончился, и не сгорают).\n\n"
+        f"👥 Приглашено: {count}\n"
+        f"🎁 Бонусов на счету: {bonus}"
+    )
+
+
+@router.message(Command("stats"))
+async def cmd_stats(m: Message):
+    """Статистика бота — только для админа."""
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    s = await db.get_stats()
+    await m.answer(
+        "📊 Статистика:\n\n"
+        f"👥 Пользователей всего: {s['users_total']} (+{s['users_today']} сегодня)\n"
+        f"🔗 Из них по рефералкам: {s['refs_total']}\n"
+        f"⚙️ Операций всего: {s['ops_total']} (сегодня: {s['ops_today']})\n"
+        f"⭐ Активных premium: {s['premium_active']}\n"
+        f"💰 Платежей: {s['payments_total']} на {s['payments_sum']} Stars"
+    )
+
+
+@router.message(Command("grant"))
+async def cmd_grant(m: Message):
+    """/grant <user_id> — выдать premium вручную (для админа/тестов)."""
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        uid = int(m.text.split()[1])
+    except (IndexError, ValueError):
+        await m.answer("Формат: /grant <user_id>")
+        return
+    await db.grant_premium(uid)
+    await m.answer(f"Premium выдан пользователю {uid} на 30 дней.")
+
+
+# ---------- Оплата через Telegram Stars ----------
+
+@router.callback_query(F.data == "buy_premium")
+async def cb_buy(cb):
+    prices = [LabeledPrice(label="Premium на 30 дней", amount=PREMIUM_PRICE_STARS)]
+    await cb.message.answer_invoice(
+        title="Premium-подписка",
+        description="Безлимитные операции на 30 дней.",
+        payload="premium_30d",
+        currency="XTR",
+        prices=prices,
+    )
+    await cb.answer()
+
+
+@router.pre_checkout_query()
+async def pre_checkout(q: PreCheckoutQuery):
+    await q.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def payment_ok(m: Message):
+    await db.grant_premium(m.from_user.id, days=30)
+    await db.log_payment(m.from_user.id, m.successful_payment.total_amount)
+    await m.answer("✅ Оплата прошла! Premium активен 30 дней. Спасибо!")
+
+
+# ---------- Сжатие PDF ----------
+
+@router.callback_query(F.data == "mode_compress")
+async def cb_compress(cb):
+    await cb.message.answer("Пришли PDF-файл — сожму его (одним сообщением, как документ).")
+    await cb.answer()
+
+
+@router.callback_query(F.data == "mode_merge")
+async def cb_merge(cb, state: FSMContext):
+    await state.set_state(MergeState.collecting)
+    await state.update_data(files=[])
+    await cb.message.answer(
+        "Режим склейки. Присылай PDF-файлы по одному. "
+        "Когда закончишь — отправь /done. Отмена — /cancel."
+    )
+    await cb.answer()
+
+
+async def download_doc(bot: Bot, m: Message) -> Path | None:
+    doc = m.document
+    if doc.file_size and doc.file_size > MAX_FILE_SIZE:
+        await m.answer("Файл больше 20 МБ — такие Bot API скачать не даёт 😔")
+        return None
+    if not (doc.file_name or "").lower().endswith(".pdf"):
+        await m.answer("Пока умею только PDF. Пришли файл с расширением .pdf")
+        return None
+    Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
+    dest = Path(DOWNLOAD_DIR) / f"{m.from_user.id}_{doc.file_unique_id}.pdf"
+    await bot.download(doc, destination=dest)
+    return dest
+
+
+@router.message(F.document, MergeState.collecting)
+async def collect_for_merge(m: Message, state: FSMContext, bot: Bot):
+    dest = await download_doc(bot, m)
+    if not dest:
+        return
+    data = await state.get_data()
+    data["files"].append(str(dest))
+    await state.update_data(files=data["files"])
+    await m.answer(f"Принял! Всего файлов: {len(data['files'])}. Ещё или /done")
+
+
+@router.message(Command("done"), MergeState.collecting)
+async def do_merge(m: Message, state: FSMContext):
+    data = await state.get_data()
+    files = [Path(p) for p in data.get("files", [])]
+    await state.clear()
+    if len(files) < 2:
+        await m.answer("Нужно минимум 2 файла для склейки.")
+        return
+    if not await db.consume_quota(m.from_user.id):
+        await m.answer(limit_text(), reply_markup=main_kb())
+        return
+    out = Path(DOWNLOAD_DIR) / f"{m.from_user.id}_merged.pdf"
+    try:
+        pages = await asyncio.to_thread(merge_pdfs, files, out)
+        await m.answer_document(
+            BufferedInputFile(out.read_bytes(), filename="merged.pdf"),
+            caption=f"Готово! Склеено {len(files)} файлов, {pages} стр.",
+        )
+    finally:
+        for f in files + [out]:
+            f.unlink(missing_ok=True)
+
+
+@router.message(Command("cancel"), MergeState.collecting)
+async def cancel_merge(m: Message, state: FSMContext):
+    data = await state.get_data()
+    for p in data.get("files", []):
+        Path(p).unlink(missing_ok=True)
+    await state.clear()
+    await m.answer("Отменил. Выбери действие 👇", reply_markup=main_kb())
+
+
+@router.message(F.document)
+async def do_compress(m: Message, bot: Bot):
+    """Любой документ вне режима склейки — сжимаем."""
+    src = await download_doc(bot, m)
+    if not src:
+        return
+    if not await db.consume_quota(m.from_user.id):
+        src.unlink(missing_ok=True)
+        await m.answer(limit_text(), reply_markup=main_kb())
+        return
+    wait = await m.answer("Сжимаю… ⏳")
+    dst = src.with_name(src.stem + "_min.pdf")
+    try:
+        before, after = await asyncio.to_thread(compress_pdf, src, dst)
+        ratio = f" ({human_size(before)} → {human_size(after)})"
+        await m.answer_document(
+            BufferedInputFile(dst.read_bytes(), filename=f"compressed_{src.name.split('_', 1)[-1]}"),
+            caption=f"Готово!{ratio}",
+        )
+    finally:
+        await wait.delete()
+        src.unlink(missing_ok=True)
+        dst.unlink(missing_ok=True)
+
+
+
+@router.callback_query(F.data == "mode_note")
+async def cb_note(cb):
+    await cb.message.answer(
+        "Пришли видео (как файл или обычным видео) — верну кружочком. "
+        "Обрежу до 60 секунд, если длиннее."
+    )
+    await cb.answer()
+
+
+@router.message(F.video | (F.document & F.document.mime_type.startswith("video/")))
+async def do_video_note(m: Message, bot: Bot):
+    """Видео → кружочек."""
+    media = m.video or m.document
+    if media.file_size and media.file_size > MAX_FILE_SIZE:
+        await m.answer("Файл больше 20 МБ — такие Bot API скачать не даёт 😔")
+        return
+    if not await db.consume_quota(m.from_user.id):
+        await m.answer(limit_text(), reply_markup=main_kb())
+        return
+
+    Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
+    src = Path(DOWNLOAD_DIR) / f"{m.from_user.id}_{media.file_unique_id}.mp4"
+    dst = src.with_name(src.stem + "_note.mp4")
+    wait = await m.answer("Конвертирую в кружочек… ⏳")
+    try:
+        await bot.download(media, destination=src)
+        await video_to_note(src, dst)
+        await m.answer_video_note(
+            BufferedInputFile(dst.read_bytes(), filename="note.mp4")
+        )
+    except RuntimeError as e:
+        await m.answer(f"Не получилось обработать видео: {e}")
+    finally:
+        await wait.delete()
+        src.unlink(missing_ok=True)
+        dst.unlink(missing_ok=True)
+
+
+
+@router.callback_query(F.data == "show_ref")
+async def cb_ref(cb, bot: Bot):
+    me = await bot.me()
+    count = await db.get_ref_count(cb.from_user.id)
+    bonus = await db.get_bonus(cb.from_user.id)
+    link = f"https://t.me/{me.username}?start=ref{cb.from_user.id}"
+    await cb.message.answer(
+        "🔗 Твоя реферальная ссылка:\n"
+        f"{link}\n\n"
+        f"За каждого нового пользователя — +{db.REF_BONUS} бонусные операции.\n"
+        f"👥 Приглашено: {count} | 🎁 Бонусов: {bonus}"
+    )
+    await cb.answer()
+
+
+def limit_text() -> str:
+    return (
+        f"Бесплатный лимит ({FREE_DAILY_LIMIT} операции в день) исчерпан.\n"
+        "Оформи Premium — без ограничений 👇"
+    )
+
+
+async def main():
+    await db.init_db()
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
