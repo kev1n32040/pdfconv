@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS users (
     first_seen  TEXT    NOT NULL,
     referred_by INTEGER,
     bonus       INTEGER NOT NULL DEFAULT 0,
-    total_ops   INTEGER NOT NULL DEFAULT 0
+    total_ops   INTEGER NOT NULL DEFAULT 0,
+    source      TEXT
 );
 CREATE TABLE IF NOT EXISTS payments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,13 +38,19 @@ REF_BONUS = 3  # бонусных операций за приглашённог
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_SQL)
+        # миграция старых баз: колонка source появилась позже
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN source TEXT")
+        except aiosqlite.OperationalError:
+            pass  # колонка уже есть
         await db.commit()
 
 
 # ---------- Пользователи и рефералка ----------
 
 async def register_user(user_id: int, username: str | None,
-                        referrer_id: int | None = None) -> bool:
+                        referrer_id: int | None = None,
+                        source: str | None = None) -> bool:
     """Регистрирует юзера. Возвращает True, если юзер новый."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
@@ -52,9 +59,9 @@ async def register_user(user_id: int, username: str | None,
             # сам себе реферером быть не может
             ref = referrer_id if referrer_id and referrer_id != user_id else None
             await db.execute(
-                "INSERT INTO users (user_id, username, first_seen, referred_by) "
-                "VALUES (?, ?, ?, ?)",
-                (user_id, username, date.today().isoformat(), ref),
+                "INSERT INTO users (user_id, username, first_seen, referred_by, source) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, username, date.today().isoformat(), ref, source),
             )
             if ref:
                 # начисляем бонус, только если пригласивший существует
@@ -165,6 +172,17 @@ async def log_payment(user_id: int, amount: int):
             (user_id, amount, date.today().isoformat()),
         )
         await db.commit()
+
+
+async def get_source_stats(limit: int = 10) -> list[tuple[str, int]]:
+    """Разбивка пользователей по источникам (метки src_...)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(source, 'прямой заход / прочее'), COUNT(*) AS c "
+            "FROM users GROUP BY source ORDER BY c DESC LIMIT ?",
+            (limit,),
+        )
+        return await cur.fetchall()
 
 
 # ---------- Статистика (для админа) ----------

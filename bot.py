@@ -53,15 +53,21 @@ def main_kb() -> InlineKeyboardMarkup:
 
 @router.message(CommandStart())
 async def cmd_start(m: Message, command: CommandObject, bot: Bot):
-    # реферальный payload: /start ref123
+    # payload: /start ref123 (рефералка) и /start src_tgram (метка источника)
     referrer = None
-    if command.args and command.args.startswith("ref"):
-        try:
-            referrer = int(command.args[3:])
-        except ValueError:
-            pass
+    source = None
+    if command.args:
+        if command.args.startswith("ref"):
+            try:
+                referrer = int(command.args[3:])
+            except ValueError:
+                pass
+        elif command.args.startswith("src_"):
+            source = command.args[:32]  # метка источника рекламы
 
-    is_new = await db.register_user(m.from_user.id, m.from_user.username, referrer)
+    is_new = await db.register_user(
+        m.from_user.id, m.from_user.username, referrer, source
+    )
 
     if is_new and referrer:
         # сообщаем пригласившему о бонусе
@@ -112,13 +118,16 @@ async def cmd_stats(m: Message):
     if m.from_user.id not in ADMIN_IDS:
         return
     s = await db.get_stats()
+    sources = await db.get_source_stats()
+    src_lines = "\n".join(f"   • {name}: {cnt}" for name, cnt in sources) or "   • пока пусто"
     await m.answer(
         "📊 Статистика:\n\n"
         f"👥 Пользователей всего: {s['users_total']} (+{s['users_today']} сегодня)\n"
         f"🔗 Из них по рефералкам: {s['refs_total']}\n"
         f"⚙️ Операций всего: {s['ops_total']} (сегодня: {s['ops_today']})\n"
         f"⭐ Активных premium: {s['premium_active']}\n"
-        f"💰 Платежей: {s['payments_total']} на {s['payments_sum']} Stars"
+        f"💰 Платежей: {s['payments_total']} на {s['payments_sum']} Stars\n\n"
+        f"📍 Источники прихода:\n{src_lines}"
     )
 
 
