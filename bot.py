@@ -30,7 +30,7 @@ router = Router()
 ADMIN_IDS: set[int] = {8593355445}
 PREMIUM_PRICE_STARS = 100   # цена подписки на 30 дней в Telegram Stars
 PREMIUM_PRICE_USDT = 2      # ориентировочная цена в USDT для крипто-оплаты
-CRYPTOBOT_TOKEN = os.getenv("CRYPTOBOT_TOKEN", "")  # токен от @CryptoBot (@CryptoTestnetBot для тестов)
+CRYPTOCLOUD_TOKEN = os.getenv("CRYPTOCLOUD_TOKEN", "")  # API-токен из cryptocloud.plus
 
 
 class MergeState(StatesGroup):
@@ -165,13 +165,13 @@ async def cb_pay_stars(cb):
 
 @router.callback_query(F.data == "pay_crypto")
 async def cb_pay_crypto(cb):
-    if not CRYPTOBOT_TOKEN:
+    if not CRYPTOCLOUD_TOKEN:
         await cb.message.answer("Крипто-оплата временно недоступна. Попробуй Stars ⭐")
         await cb.answer()
         return
     try:
-        from crypto import create_invoice
-        inv = await create_invoice(CRYPTOBOT_TOKEN, cb.from_user.id, PREMIUM_PRICE_USDT)
+        from cryptocloud import create_invoice
+        inv = await create_invoice(cb.from_user.id, PREMIUM_PRICE_USDT)
     except Exception as e:
         logging.exception("crypto invoice failed")
         await cb.message.answer(f"Не удалось создать счёт: {e}")
@@ -191,10 +191,10 @@ async def cb_pay_crypto(cb):
 
 @router.callback_query(F.data.startswith("check_crypto:"))
 async def cb_check_crypto(cb):
-    invoice_id = int(cb.data.split(":")[1])
+    invoice_id = cb.data.split(":", 1)[1]
     try:
-        from crypto import check_invoice
-        paid = await check_invoice(CRYPTOBOT_TOKEN, invoice_id, cb.from_user.id)
+        from cryptocloud import check_invoice
+        paid = await check_invoice(invoice_id, cb.from_user.id)
     except Exception as e:
         logging.exception("crypto check failed")
         await cb.message.answer(f"Ошибка проверки: {e}")
@@ -202,16 +202,15 @@ async def cb_check_crypto(cb):
         return
     if paid:
         await db.grant_premium(cb.from_user.id, days=30)
-        await db.log_payment(cb.from_user.id, 0)  # сумма в Stars = 0, т.к. крипта
+        await db.log_payment(cb.from_user.id, 0)  # крипта, сумма в Stars = 0
         await cb.message.answer("✅ Оплата получена! Premium активен на 30 дней. Спасибо!")
     else:
-        await cb.answer("Оплата пока не найдена. Если только что платил — подожди минуту и проверь снова.", show_alert=True)
+        await cb.answer(
+            "Оплата пока не найдена. Если только что платил — подожди минуту и проверь снова.",
+            show_alert=True,
+        )
         return
     await cb.answer()
-
-@router.pre_checkout_query()
-async def pre_checkout(q: PreCheckoutQuery):
-    await q.answer(ok=True)
 
 
 @router.message(F.successful_payment)
