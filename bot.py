@@ -20,7 +20,14 @@ from aiogram.types import (
 )
 
 import db
-from config import BOT_TOKEN, DOWNLOAD_DIR, FREE_DAILY_LIMIT, MAX_FILE_SIZE
+from config import (
+    BOT_TOKEN,
+    CRYPTOCLOUD_SHOP_ID,
+    CRYPTOCLOUD_TOKEN,
+    DOWNLOAD_DIR,
+    FREE_DAILY_LIMIT,
+    MAX_FILE_SIZE,
+)
 from pdf_tools import compress_pdf, human_size, merge_pdfs
 from video_tools import video_to_note
 
@@ -30,7 +37,7 @@ router = Router()
 ADMIN_IDS: set[int] = {8593355445}
 PREMIUM_PRICE_STARS = 100   # цена подписки на 30 дней в Telegram Stars
 PREMIUM_PRICE_USDT = 2      # ориентировочная цена в USDT для крипто-оплаты
-CRYPTOCLOUD_TOKEN = os.getenv("CRYPTOCLOUD_TOKEN", "")  # API-токен из cryptocloud.plus
+
 
 
 class MergeState(StatesGroup):
@@ -165,16 +172,21 @@ async def cb_pay_stars(cb):
 
 @router.callback_query(F.data == "pay_crypto")
 async def cb_pay_crypto(cb):
-    if not CRYPTOCLOUD_TOKEN:
+    from cryptocloud import CryptoError, create_invoice
+    if not CRYPTOCLOUD_TOKEN or not CRYPTOCLOUD_SHOP_ID:
         await cb.message.answer("Крипто-оплата временно недоступна. Попробуй Stars ⭐")
         await cb.answer()
         return
     try:
-        from cryptocloud import create_invoice
         inv = await create_invoice(cb.from_user.id, PREMIUM_PRICE_USDT)
+    except CryptoError as e:
+        logging.error("crypto invoice failed: %s", e)
+        await cb.message.answer(f"Не удалось создать счёт: {e}")
+        await cb.answer()
+        return
     except Exception as e:
         logging.exception("crypto invoice failed")
-        await cb.message.answer(f"Не удалось создать счёт: {e}")
+        await cb.message.answer("Платёжный сервис не отвечает. Попробуй позже или Stars ⭐")
         await cb.answer()
         return
     await cb.message.answer(
@@ -192,12 +204,12 @@ async def cb_pay_crypto(cb):
 @router.callback_query(F.data.startswith("check_crypto:"))
 async def cb_check_crypto(cb):
     invoice_id = cb.data.split(":", 1)[1]
+    from cryptocloud import check_invoice
     try:
-        from cryptocloud import check_invoice
         paid = await check_invoice(invoice_id, cb.from_user.id)
     except Exception as e:
         logging.exception("crypto check failed")
-        await cb.message.answer(f"Ошибка проверки: {e}")
+        await cb.message.answer("Платёжный сервис не отвечает. Нажми ещё раз через минуту.")
         await cb.answer()
         return
     if paid:
