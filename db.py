@@ -174,6 +174,17 @@ async def log_payment(user_id: int, amount: int):
         await db.commit()
 
 
+async def get_inactive_new_users() -> list[int]:
+    """Юзеры, зарегистрированные вчера и не сделавшие ни одной операции."""
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id FROM users WHERE first_seen = ? AND total_ops = 0",
+            (yesterday,),
+        )
+        return [r[0] for r in await cur.fetchall()]
+
+
 async def get_source_stats(limit: int = 10) -> list[tuple[str, int]]:
     """Разбивка пользователей по источникам (метки src_...)."""
     async with aiosqlite.connect(DB_PATH) as db:

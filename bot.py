@@ -418,11 +418,46 @@ def limit_text() -> str:
     )
 
 
+NUDGE_TEXT = (
+    "Привет! Ты вчера заглянул ко мне, но так и не прислал ни одного файла 🙂\n\n"
+    "Попробуй на секунду: кинь любой PDF — сожму за пару секунд. "
+    "Или видео — сделаю кружочек.\n\n"
+    "Первые 3 операции каждый день бесплатны, без регистраций и сайтов."
+)
+
+
+def _seconds_until_noon() -> float:
+    from datetime import datetime, time as dtime, timedelta as td
+    now = datetime.now()
+    target = datetime.combine(now.date(), dtime(12, 0))
+    if target <= now:
+        target += td(days=1)
+    return (target - now).total_seconds()
+
+
+async def nudge_loop(bot: Bot):
+    """Раз в сутки пишем тем, кто зарегистрировался вчера и ничего не попробовал."""
+    while True:
+        await asyncio.sleep(_seconds_until_noon())
+        try:
+            ids = await db.get_inactive_new_users()
+            logging.info("nudge: %d inactive users", len(ids))
+            for uid in ids:
+                try:
+                    await bot.send_message(uid, NUDGE_TEXT, reply_markup=main_kb())
+                    await asyncio.sleep(0.1)  # не упереться в лимиты отправки
+                except Exception:
+                    pass  # заблокировал бота — пропускаем молча
+        except Exception:
+            logging.exception("nudge loop failed")
+
+
 async def main():
     await db.init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    asyncio.create_task(nudge_loop(bot))
     await dp.start_polling(bot)
 
 
