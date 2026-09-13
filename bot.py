@@ -153,7 +153,7 @@ async def cb_buy(cb):
         "Выбери способ оплаты Premium (30 дней безлимита):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"⭐ Telegram Stars ({PREMIUM_PRICE_STARS}⭐)", callback_data="pay_stars")],
-            [InlineKeyboardButton(text=f"💎 Крипта (~{PREMIUM_PRICE_USDT} USDT / TON / BTC)", callback_data="pay_crypto")],
+            [InlineKeyboardButton(text=f"💎 Крипта (USDT / TON / BTC)", callback_data="pay_crypto")],
         ]),
     )
     await cb.answer()
