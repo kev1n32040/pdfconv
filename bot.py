@@ -198,7 +198,7 @@ async def cb_pay_crypto(cb):
         await cb.answer()
         return
     await cb.message.answer(
-        f"💎 Счёт на {PREMIUM_PRICE_USDT} USDT (можно платить USDT, TON, BTC и др.):\n\n"
+        f"💎 Счёт на {PREMIUM_PRICE_USDT} USD (можно платить USDT, TON, BTC и др.):\n\n"
         "1. Оплати по кнопке ниже\n"
         "2. Вернись сюда и нажми «Проверить оплату»",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
